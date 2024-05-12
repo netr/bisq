@@ -5,20 +5,11 @@ import (
 	"strings"
 )
 
-type Builder struct {
-	query         strings.Builder
-	tableName     string
-	whereBlocks   []Block
-	limitBlock    Block
-	offsetBlock   Block
-	prevBlock     Block
-	orderByBlocks []Block
-}
-
 type Block interface {
 	String() string
 }
 
+// OrderByBlock is a block that represents an ORDER BY condition. Can be stacked to order by multiple columns. Defaults to ascending order.
 type OrderByBlock struct {
 	column    string
 	direction string
@@ -28,12 +19,18 @@ func (o *OrderByBlock) String() string {
 	return fmt.Sprintf("%v %v", o.column, o.direction)
 }
 
+// WhereBlock is a block that represents a WHERE condition
 type WhereBlock struct {
 	column string
 	value  interface{}
 	op     string
 }
 
+func (w *WhereBlock) String() string {
+	return fmt.Sprintf("%v %v %v", w.column, w.op, "[WHERE]")
+}
+
+// OffsetBlock is a block that represents an OFFSET condition
 type OffsetBlock struct {
 	offset int
 }
@@ -42,6 +39,7 @@ func (o *OffsetBlock) String() string {
 	return fmt.Sprintf("OFFSET %v", o.offset)
 }
 
+// LimitBlock is a block that represents a LIMIT condition
 type LimitBlock struct {
 	limit int
 }
@@ -50,10 +48,7 @@ func (l *LimitBlock) String() string {
 	return fmt.Sprintf("LIMIT %v", l.limit)
 }
 
-func (w *WhereBlock) String() string {
-	return fmt.Sprintf("%v %v %v", w.column, w.op, "[WHERE]")
-}
-
+// WhereNullBlock is a block that represents a WHERE column IS NULL condition
 type WhereNullBlock struct {
 	column string
 }
@@ -62,12 +57,24 @@ func (w *WhereNullBlock) String() string {
 	return fmt.Sprintf("%v IS NULL", w.column)
 }
 
+// OrBlock is a block that represents an OR condition
 type OrBlock struct{}
 
 func (o *OrBlock) String() string {
 	return "OR"
 }
 
+type Builder struct {
+	query     strings.Builder // Query string
+	tableName string          // Table name
+	wheres    []Block         // WhereBlock, WhereNullBlock, OrBlock, WhereFnBlock
+	limit     Block           // LimitBlock
+	offset    Block           // OffsetBlock
+	prev      Block           // used to determine if the previous block was an OrBlock
+	orderBys  []Block         // OrderByBlock
+}
+
+// WhereFnBlock is a block that allows for nested where conditions
 type WhereFnBlock struct {
 	fn func(b *Builder)
 }
@@ -77,13 +84,41 @@ func (w *WhereFnBlock) String() string {
 
 }
 
+// Table creates a new Builder instance with the table name
 func Table(name string) *Builder {
 	b := &Builder{
-		tableName:     name,
-		whereBlocks:   make([]Block, 0),
-		orderByBlocks: []Block{},
+		tableName: name,
+		wheres:    make([]Block, 0),
+		orderBys:  []Block{},
 	}
 	return b
+}
+
+func (b *Builder) String() string {
+	return b.query.String()
+}
+
+func (b *Builder) Values() []interface{} {
+	values := make([]interface{}, 0)
+	return b.recursiveValues(values)
+}
+
+func (b *Builder) recursiveValues(values []interface{}) []interface{} {
+	for _, block := range b.wheres {
+		if w, ok := block.(*WhereBlock); ok {
+			values = append(values, w.value)
+		}
+		if wfn, ok := block.(*WhereFnBlock); ok {
+			wBuilder := &Builder{
+				tableName: b.tableName,
+				wheres:    make([]Block, 0),
+				orderBys:  []Block{},
+			}
+			wfn.fn(wBuilder)
+			values = append(wBuilder.recursiveValues(values))
+		}
+	}
+	return values
 }
 
 func (b *Builder) Get(columns ...string) *Builder {
@@ -96,15 +131,15 @@ func (b *Builder) Get(columns ...string) *Builder {
 	b.query.WriteString(" FROM ")
 	b.query.WriteString(b.tableName)
 
-	if len(b.whereBlocks) > 0 {
+	if len(b.wheres) > 0 {
 		b.query.WriteString(" WHERE ")
 		whereQuery, _ := b.buildWhereClause(0)
 		b.query.WriteString(whereQuery)
 	}
 
-	if len(b.orderByBlocks) > 0 {
+	if len(b.orderBys) > 0 {
 		b.query.WriteString(" ORDER BY ")
-		for idx, block := range b.orderByBlocks {
+		for idx, block := range b.orderBys {
 			if idx > 0 {
 				b.query.WriteString(", ")
 			}
@@ -112,92 +147,68 @@ func (b *Builder) Get(columns ...string) *Builder {
 		}
 	}
 
-	if b.limitBlock != nil {
+	if b.limit != nil {
 		b.query.WriteString(" ")
-		b.query.WriteString(b.limitBlock.String())
+		b.query.WriteString(b.limit.String())
 	}
 
-	if b.offsetBlock != nil {
+	if b.offset != nil {
 		b.query.WriteString(" ")
-		b.query.WriteString(b.offsetBlock.String())
+		b.query.WriteString(b.offset.String())
 	}
 	b.query.WriteString(";")
 	return b
 }
 
-func (b *Builder) Values() []interface{} {
-	values := make([]interface{}, 0)
-	return b.recursiveValues(values)
-}
-
-func (b *Builder) recursiveValues(values []interface{}) []interface{} {
-	for _, block := range b.whereBlocks {
-		if w, ok := block.(*WhereBlock); ok {
-			values = append(values, w.value)
-		}
-		if wfn, ok := block.(*WhereFnBlock); ok {
-			wBuilder := &Builder{
-				tableName:     b.tableName,
-				whereBlocks:   make([]Block, 0),
-				orderByBlocks: []Block{},
-			}
-			wfn.fn(wBuilder)
-			values = append(wBuilder.recursiveValues(values))
-		}
-	}
-	return values
-}
-
 func (b *Builder) buildWhereClause(whereValue int) (string, int) {
-	var subQuery strings.Builder
+	var subSB strings.Builder
 
-	for idx, block := range b.whereBlocks {
-		var innerQuery strings.Builder
+	for idx, block := range b.wheres {
+		var innerSB strings.Builder
 		switch v := block.(type) {
 		case *WhereBlock:
-			innerQuery.WriteString(strings.ReplaceAll(v.String(), "[WHERE]", fmt.Sprintf("%v", "$"+fmt.Sprintf("%v", whereValue+1))))
+			innerSB.WriteString(strings.ReplaceAll(v.String(), "[WHERE]", fmt.Sprintf("%v", "$"+fmt.Sprintf("%v", whereValue+1))))
 			whereValue++
 		case *WhereNullBlock:
-			innerQuery.WriteString(v.String())
+			innerSB.WriteString(v.String())
 		case *OrBlock:
 			// Skip appending the "OR" block directly
 		case *WhereFnBlock:
-			nestedSubBuilder := &Builder{
-				tableName:     b.tableName,
-				whereBlocks:   make([]Block, 0),
-				orderByBlocks: []Block{},
+			innerBuilder := &Builder{
+				tableName: b.tableName,
+				wheres:    make([]Block, 0),
+				orderBys:  []Block{},
 			}
-			v.fn(nestedSubBuilder)
-			nestedSubQuery, nestedWhereValue := nestedSubBuilder.buildWhereClause(whereValue)
-			innerQuery.WriteString("(")
-			innerQuery.WriteString(nestedSubQuery)
-			innerQuery.WriteString(")")
-			whereValue = nestedWhereValue
+			v.fn(innerBuilder)
+			innerSubQuery, innerSubWhereValue := innerBuilder.buildWhereClause(whereValue)
+			innerSB.WriteString("(")
+			innerSB.WriteString(innerSubQuery)
+			innerSB.WriteString(")")
+			whereValue = innerSubWhereValue
 		}
 
 		if idx > 0 {
-			if _, ok := b.prevBlock.(*OrBlock); ok {
-				subQuery.WriteString(" OR ")
+			if _, ok := b.prev.(*OrBlock); ok {
+				subSB.WriteString(" OR ")
 			} else {
 				if _, ok := block.(*OrBlock); !ok {
-					subQuery.WriteString(" AND ")
+					subSB.WriteString(" AND ")
 				}
 			}
 		}
 
-		subQuery.WriteString(innerQuery.String())
-
-		b.prevBlock = block
+		subSB.WriteString(innerSB.String())
+		b.prev = block
 	}
 
-	return subQuery.String(), whereValue
+	return subSB.String(), whereValue
 }
 
 func (b *Builder) Limit(limit int) *Builder {
 	block := &LimitBlock{
 		limit: limit,
 	}
-	b.limitBlock = block
+	b.limit = block
 	return b
 }
 
@@ -205,10 +216,11 @@ func (b *Builder) Offset(offset int) *Builder {
 	block := &OffsetBlock{
 		offset: offset,
 	}
-	b.offsetBlock = block
+	b.offset = block
 	return b
 }
 
+// OrderBy adds an ORDER BY condition to the query
 func (b *Builder) OrderBy(column, direction string) *Builder {
 	if strings.ToLower(direction) != "asc" && strings.ToLower(direction) != "desc" {
 		direction = "asc"
@@ -219,10 +231,11 @@ func (b *Builder) OrderBy(column, direction string) *Builder {
 		column:    column,
 		direction: direction,
 	}
-	b.orderByBlocks = append(b.orderByBlocks, &block)
+	b.orderBys = append(b.orderBys, &block)
 	return b
 }
 
+// Where adds a WHERE condition to the query
 func (b *Builder) Where(column string, value ...interface{}) *Builder {
 	if len(value) == 0 {
 		return b
@@ -241,32 +254,31 @@ func (b *Builder) Where(column string, value ...interface{}) *Builder {
 		}
 	}
 
-	b.whereBlocks = append(b.whereBlocks, block)
+	b.wheres = append(b.wheres, block)
 	return b
 }
 
+// WhereNull adds a WHERE column IS NULL condition to the query.
 func (b *Builder) WhereNull(column string) *Builder {
 	block := &WhereNullBlock{
 		column: column,
 	}
-	b.whereBlocks = append(b.whereBlocks, block)
+	b.wheres = append(b.wheres, block)
 	return b
 }
 
+// WhereFn adds a WHERE closure that can be used to nest conditions and wrap them in parentheses.
 func (b *Builder) WhereFn(fn func(b *Builder)) *Builder {
 	block := &WhereFnBlock{
 		fn: fn,
 	}
-	b.whereBlocks = append(b.whereBlocks, block)
+	b.wheres = append(b.wheres, block)
 	return b
 }
 
+// Or adds an OR condition to the query
 func (b *Builder) Or() *Builder {
 	block := &OrBlock{}
-	b.whereBlocks = append(b.whereBlocks, block)
+	b.wheres = append(b.wheres, block)
 	return b
-}
-
-func (b *Builder) String() string {
-	return b.query.String()
 }
